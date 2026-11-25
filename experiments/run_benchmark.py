@@ -336,6 +336,7 @@ def run_batch_strategy(
     )
     summary["model"] = name
     summary["family"] = "Batch_XGBoost"
+    summary["ADWIN_Drifts"] = 0.0
     summary["wall_time_sec"] = round(time.perf_counter() - t0_wall, 2)
     return summary, chunk_rows
 
@@ -472,7 +473,7 @@ def main() -> None:
         print(
             f"     {strat}: AP={s_row['AP']:.4f}, Pr@k={s_row['Pr@k']:.4f}, "
             f"Recall={s_row['Recall']:.4f}, FP={int(s_row['FP'])}, "
-            f"Queries={int(s_row['FastTrack_Queries'])}, Yield={s_row['Verification_Yield']:.4f}, "
+            f"Queries={int(s_row['FastTrack_Queries'])}, Yield={s_row['Verification_Yield']:.4f}, drifts={int(s_row['ADWIN_Drifts'])}, "
             f"lat={s_row['mean_latency_ms']:.3f}ms ({s_row['wall_time_sec']}s)"
         )
 
@@ -522,6 +523,7 @@ def main() -> None:
         "FastTrack_Queries",
         "FastTrack_Frauds",
         "Verification_Yield",
+        "ADWIN_Drifts",
         "mean_latency_ms",
         "p99_latency_ms",
         "wall_time_sec",

@@ -21,7 +21,6 @@ OnlineML-ActiveFraud/
 │   └── test_adwin_drift.py  # 3 unit tests cho ADWIN error-stream, cooldown boost & tái hiệu chỉnh ngưỡng
 ├── results/                 # ablation_al_summary.csv, chunk_metrics.csv và 4 biểu đồ PNG
 ├── dashboard.py             # Streamlit + Plotly Payment Edge Monitor (Live Stream + Benchmark)
-├── Bao_cao_AL_SV.pdf        # Báo cáo chuyên đề đen trắng chuẩn ĐHBK TP.HCM
 ├── SPEC_AL_SV.md            # Đặc tả kỹ thuật triển khai
 ├── REPORT.md                # Báo cáo tóm tắt thực nghiệm
 └── requirements.txt
@@ -43,10 +42,10 @@ python -m pip install -r requirements.txt
 pytest -v
 
 # Chạy thực nghiệm đối chứng 8 mô hình (ULB creditcard.csv)
-python experiments/run_benchmark.py --seed 42 --beta 0.005
+python -m experiments.run_benchmark --seed 42 --beta 0.005
 
 # Sinh 4 biểu đồ phân tích
-python experiments/plot_results.py
+python -m experiments.plot_results
 
 # Mở Streamlit Payment Edge Monitor (Live Stream + Benchmark)
 streamlit run dashboard.py
