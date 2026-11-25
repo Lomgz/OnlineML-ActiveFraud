@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.active_learning import CausalQuantileThreshold, VerificationController
+from src.drift import ADWINDriftManager
 from src.metrics import compute_metrics
 from src.models import BatchXGBoostWrapper, OnlineFraudModel, SemiSupervisedHST
 from src.simulator import DelayedLabelQueue, prepare_temporal_split
@@ -115,6 +116,10 @@ def run_online_strategy(
         initial_disc_threshold=init_disc_threshold,
         seed=seed,
     )
+    drift_mgr = ADWINDriftManager(
+        base_disc_ratio=1.0 - hybrid_top_ratio,
+        boosted_disc_ratio=min(0.60, (1.0 - hybrid_top_ratio) + 0.20),
+    )
 
     n_test = len(test_y)
     y_scores = np.zeros(n_test, dtype=np.float64)
@@ -142,6 +147,16 @@ def run_online_strategy(
             oml.learn_one(ev.x, ev.y_observed)
             if use_hst and hst is not None:
                 hst.learn_one(ev.x, ev.y_observed)
+            if ev.tx_id >= 0:
+                drift_fired = drift_mgr.update(
+                    y_pred=ev.y_pred_at_arrive,
+                    y_true=ev.y_observed,
+                    current_time=t_now,
+                )
+                if drift_fired:
+                    threshold_mgr.recalibrate_on_drift()
+                if strategy == "B4_Hybrid":
+                    ctrl.set_discordance_ratio(drift_mgr.get_current_disc_ratio())
             chunk_matured_X.append(event_x_to_vec(ev.x, feature_cols))
             chunk_matured_y.append(int(ev.y_observed))
 
@@ -172,6 +187,7 @@ def run_online_strategy(
             y_true=y_true_i,
             is_fast_track=dec.should_query,
             p_hat_at_arrive=p_hat,
+            y_pred_at_arrive=y_pred_i,
         )
 
         # 4. Chunk boundary accounting & causal threshold update
@@ -218,6 +234,7 @@ def run_online_strategy(
     )
     summary["model"] = strategy
     summary["family"] = "Online_ARF"
+    summary["ADWIN_Drifts"] = float(len(drift_mgr.drift_events))
     summary["wall_time_sec"] = round(time.perf_counter() - t0_wall, 2)
     return summary, chunk_rows, matured_by_chunk
 

@@ -18,6 +18,7 @@ class LabelEvent:
     y_true: int
     is_fast_track: bool
     p_hat_at_arrive: float
+    y_pred_at_arrive: int = 0
 
 
 class DelayedLabelQueue:
@@ -61,6 +62,7 @@ class DelayedLabelQueue:
         y_true: int,
         is_fast_track: bool = False,
         p_hat_at_arrive: float = 0.0,
+        y_pred_at_arrive: int = 0,
     ) -> float:
         y_true_int = int(y_true)
         if is_fast_track:
@@ -91,6 +93,7 @@ class DelayedLabelQueue:
             y_true=y_true_int,
             is_fast_track=bool(is_fast_track),
             p_hat_at_arrive=float(p_hat_at_arrive),
+            y_pred_at_arrive=int(y_pred_at_arrive),
         )
         heapq.heappush(self._heap, (t_label, self._seq, event))
         return t_label

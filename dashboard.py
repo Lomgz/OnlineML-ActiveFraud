@@ -5,12 +5,10 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -18,6 +16,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.active_learning import CausalQuantileThreshold, VerificationController
+from src.drift import ADWINDriftManager
 from src.metrics import compute_metrics
 from src.models import OnlineFraudModel, SemiSupervisedHST
 from src.simulator import DelayedLabelQueue, prepare_temporal_split
@@ -25,15 +24,55 @@ from src.simulator import DelayedLabelQueue, prepare_temporal_split
 RESULTS_DIR = ROOT_DIR / "results"
 DATA_PATH = ROOT_DIR / "data" / "creditcard.csv"
 
-
 st.set_page_config(
-    page_title="OnlineML-ActiveFraud Dashboard",
+    page_title="Payment Edge Fraud Monitor — OnlineML & Active Learning",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
+
+# Anti-dimming / anti-flicker CSS (aligned with Membau/OnlineML-Fraud-Detector)
+NO_DIM_CSS = """
+<style>
+html, body, [class*="css"], [class*="st-"], .stApp,
+.stApp *,
+div[data-testid="stAppViewContainer"],
+div[data-testid="stAppViewContainer"] *,
+section.main,
+section.main *,
+div.block-container,
+div.block-container *,
+[data-testid="stFragment"],
+[data-testid="stFragment"] *,
+[data-testid="stVerticalBlock"],
+[data-testid="stVerticalBlock"] *,
+[data-testid="stElementContainer"],
+[data-testid="stElementContainer"] *,
+div[data-testid="stPlotlyChart"],
+div[data-testid="stPlotlyChart"] * {
+    opacity: 1 !important;
+    filter: none !important;
+    transition: none !important;
+    animation: none !important;
+}
+[data-testid="stStatusWidget"],
+div[data-testid="stStatusWidget"],
+div[data-testid="stDecoration"] {
+    display: none !important;
+    visibility: hidden !important;
+}
+.js-plotly-plot,
+.js-plotly-plot .plotly,
+.js-plotly-plot .plotly .main-svg {
+    transition: none !important;
+    opacity: 1 !important;
+}
+</style>
+"""
+st.markdown(NO_DIM_CSS, unsafe_allow_html=True)
 
 
 @st.cache_data
-def load_results():
+def load_benchmark_results():
     summary_path = RESULTS_DIR / "ablation_al_summary.csv"
     chunk_path = RESULTS_DIR / "chunk_metrics.csv"
     if not summary_path.exists() or not chunk_path.exists():
@@ -43,6 +82,8 @@ def load_results():
 
 @st.cache_data
 def load_split_for_replay(confirm_window_sec: float = 21600.0):
+    if not DATA_PATH.exists():
+        return None
     df = pd.read_csv(DATA_PATH)
     return prepare_temporal_split(
         df,
@@ -51,311 +92,164 @@ def load_split_for_replay(confirm_window_sec: float = 21600.0):
     )
 
 
-def render_comparison_tab(summary: pd.DataFrame) -> None:
-    b0 = summary.loc[summary["model"] == "B0_NoAL"].iloc[0]
-    b4 = summary.loc[summary["model"] == "B4_Hybrid"].iloc[0]
-    m_static = summary.loc[summary["model"] == "M_Static_Batch"].iloc[0]
-
-    ap_gain_pct = ((b4["AP"] - b0["AP"]) / max(1e-9, b0["AP"])) * 100.0
-    gap_closed_pct = (
-        (b4["AP"] - b0["AP"]) / max(1e-9, m_static["AP"] - b0["AP"])
-    ) * 100.0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("B4_Hybrid AP (PR-AUC)", f"{b4['AP']:.4f}", f"+{ap_gain_pct:.1f}% vs B0_NoAL")
-    c2.metric(
-        "Verification Yield (B4)",
-        f"{b4['Verification_Yield'] * 100:.2f}%",
-        f"{int(b4['FastTrack_Frauds'])}/{int(b4['FastTrack_Queries'])} gian lận thật",
-    )
-    c3.metric("Thu hẹp khoảng cách Batch", f"{gap_closed_pct:.1f}%", "AP gap vs Static XGB")
-    c4.metric(
-        "Độ trễ suy luận (B4)",
-        f"{b4['mean_latency_ms']:.3f} ms/tx",
-        f"p99: {b4['p99_latency_ms']:.3f} ms (< 5ms SLA)",
-    )
-
-    st.divider()
-    all_models = summary["model"].tolist()
-    selected_models = st.multiselect(
-        "Chọn các mô hình cần so sánh:",
-        options=all_models,
-        default=all_models,
-    )
-    filtered = summary[summary["model"].isin(selected_models)].copy()
-    if filtered.empty:
-        st.warning("Chọn ít nhất 1 mô hình để hiển thị.")
+def render_live_monitor_tab(
+    strategy: str,
+    beta: float,
+    window_size: int,
+    confirm_window_sec: float,
+    fast_track_delay_sec: float,
+    adwin_delta: float,
+    enable_adwin_action: bool,
+    n_stream: int,
+) -> None:
+    split_data = load_split_for_replay(confirm_window_sec=confirm_window_sec)
+    if split_data is None:
+        st.warning(f"Khong tim thay du lieu tai `{DATA_PATH}`. Vui long dat `creditcard.csv` vao `data/`.")
         return
 
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("AP (PR-AUC) & Pr@k")
-        fig, ax = plt.subplots(figsize=(6.8, 4.0))
-        x = np.arange(len(filtered))
-        w = 0.36
-        ax.bar(x - w / 2, filtered["AP"], w, label="AP (PR-AUC)", color="#2563eb")
-        ax.bar(x + w / 2, filtered["Pr@k"], w, label="Pr@k", color="#0ea5e9")
-        ax.set_xticks(x)
-        ax.set_xticklabels(filtered["model"], rotation=24, ha="right", fontsize=8.5)
-        ax.set_ylim(0, min(1.05, max(filtered["AP"].max(), filtered["Pr@k"].max()) * 1.18 + 0.05))
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-        ax.legend()
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    with col_right:
-        st.subheader("Verification Yield & Độ trễ SLA")
-        chart_mode = st.radio(
-            "Chế độ biểu đồ:",
-            ["Verification Yield (Nhóm Active Learning)", "Độ trễ suy luận vs SLA (5 ms)"],
-            horizontal=True,
-        )
-        fig, ax = plt.subplots(figsize=(6.8, 3.6))
-        if chart_mode.startswith("Verification"):
-            al_sub = filtered[filtered["FastTrack_Queries"] > 0]
-            if al_sub.empty:
-                ax.text(0.5, 0.5, "Không có mô hình Active Learning được chọn", ha="center", va="center")
-            else:
-                x = np.arange(len(al_sub))
-                bars = ax.bar(x, al_sub["Verification_Yield"] * 100.0, width=0.5, color="#10b981")
-                ax.set_xticks(x)
-                ax.set_xticklabels(al_sub["model"], fontsize=9)
-                ax.set_ylabel("Verification Yield (%)")
-                ax.grid(axis="y", linestyle="--", alpha=0.4)
-                for b, f_cnt, q_cnt in zip(bars, al_sub["FastTrack_Frauds"], al_sub["FastTrack_Queries"]):
-                    h = b.get_height()
-                    ax.annotate(
-                        f"{h:.1f}% ({int(f_cnt)}/{int(q_cnt)})",
-                        xy=(b.get_x() + b.get_width() / 2, h),
-                        xytext=(0, 3),
-                        textcoords="offset points",
-                        ha="center",
-                        fontsize=8,
-                    )
-                ax.set_ylim(0, max(10.0, al_sub["Verification_Yield"].max() * 125.0 + 3.0))
-        else:
-            x = np.arange(len(filtered))
-            w = 0.36
-            ax.bar(x - w / 2, filtered["mean_latency_ms"], w, label="Mean (ms)", color="#0284c7")
-            ax.bar(x + w / 2, filtered["p99_latency_ms"], w, label="p99 (ms)", color="#f97316")
-            ax.axhline(5.0, color="#dc2626", linestyle="--", linewidth=1.2, label="SLA 5 ms")
-            ax.set_xticks(x)
-            ax.set_xticklabels(filtered["model"], rotation=24, ha="right", fontsize=8.5)
-            ax.set_ylabel("ms / tx")
-            ax.grid(axis="y", linestyle="--", alpha=0.4)
-            ax.legend(fontsize=8)
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    st.subheader("Bảng số liệu chi tiết (142.404 giao dịch kiểm thử, 223 gian lận)")
-    display_df = filtered.copy()
-    display_df["Verification_Yield"] = (display_df["Verification_Yield"] * 100.0).map(lambda v: f"{v:.2f}%")
-    st.dataframe(display_df, hide_index=True)
-
-    with st.expander("Xem 4 biểu đồ PNG xuất chính thức cho báo cáo"):
-        p1, p2 = st.columns(2)
-        for col, fname in [
-            (p1, "fig1_overall_ap_prk.png"),
-            (p2, "fig2_verification_yield.png"),
-            (p1, "fig3_chunk_ap_trajectory.png"),
-            (p2, "fig4_latency_sla.png"),
-        ]:
-            img_path = RESULTS_DIR / fname
-            if img_path.exists():
-                col.image(str(img_path), caption=fname)
-
-
-def render_chunk_and_arch_tab(chunks: pd.DataFrame) -> None:
-    st.subheader("Quỹ đạo hiệu năng theo từng Chunk thời gian (29 chunks x 5.000 tx)")
-    c1, c2 = st.columns([2, 1])
-    models_avail = chunks["model"].unique().tolist()
-    default_models = [
-        m for m in ["B0_NoAL", "B2_TopRisk", "B4_Hybrid", "M_Static_Batch", "M_Periodic_Batch_AL"]
-        if m in models_avail
-    ]
-    chosen = c1.multiselect("Chọn mô hình vẽ quỹ đạo:", models_avail, default=default_models)
-    metric_col = c2.selectbox(
-        "Chỉ số theo dõi:",
-        ["AP", "Pr@k", "Recall", "FP", "Verification_Yield"],
-        index=0,
+    warmup_matured, warmup_pending, test_df, feature_cols = split_data
+    st.caption(
+        f"Streaming Engine: `OnlineML-ActiveFraud` | Strategy: `{strategy}` | "
+        f"Alert Budget beta: `{beta:.3%}` | Window W: `{window_size:,}` | "
+        f"Standard Delay D: `{int(confirm_window_sec)}s` | Fast-Track: `{int(fast_track_delay_sec)}s`"
     )
 
-    if chosen:
-        fig, ax = plt.subplots(figsize=(10.5, 4.2))
-        for m in chosen:
-            sub = chunks[chunks["model"] == m].sort_values("chunk_id")
-            ax.plot(sub["chunk_id"], sub[metric_col], marker="o", markersize=4, linewidth=1.7, label=m)
-        ax.set_xlabel("Chunk ID (theo thứ tự thời gian)")
-        ax.set_ylabel(metric_col)
-        ax.grid(True, linestyle="--", alpha=0.35)
-        ax.legend(loc="best", fontsize=8.5)
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    st.divider()
-    st.subheader("Sơ đồ kiến trúc luồng Active Learning & Selective Verification")
-    st.code(
-        """
-[Giao dịch x_t đến tại t_arrive]
-        │
-        ├──► 1. Pop nhãn đã đáo hạn (t_label <= t_arrive) từ DelayedLabelQueue
-        │         ├──► ARFClassifier.learn_one(x, y_obs)
-        │         └──► SemiSupervisedHST.learn_one(x, y_obs)  [CHỈ học khi y_obs == 0]
-        │
-        ├──► 2. Suy luận nhân quả (Causal Predict)
-        │         ├──► p_hat = ARF.predict_proba_one(x_t)
-        │         ├──► S_HST = HST.score_one(x_t)
-        │         └──► Delta_disc = S_HST - p_hat  (HST–Tree Discordance)
-        │
-        ├──► 3. VerificationController (Khóa trần ngân sách B = 0.5% / chunk)
-        │         ├──► 70% Top-Risk (khai thác p_hat cao)
-        │         └──► 30% Discordance (mở điểm mù khi HST cao nhưng ARF tự tin bỏ sót)
-        │
-        └──► 4. Đẩy vào DelayedLabelQueue
-                  ├──► Fast-Track (nếu kích hoạt AL): trả nhãn thực sau 300s
-                  └──► Standard Channel (còn lại): trả nhãn trễ 1.800s – 21.600s (+5% unreported)
-        """.strip(),
-        language="text",
-    )
-
-
-def render_live_replay_tab() -> None:
-    st.subheader("Mô phỏng luồng giao dịch trực tiếp (Live Stream Replay)")
-    if not DATA_PATH.exists():
-        st.warning(
-            "Không tìm thấy `data/creditcard.csv` trong thư mục local. "
-            "Tab 1 và Tab 2 vẫn xem bình thường từ `results/*.csv`; "
-            "để chạy mô phỏng live, hãy đặt `creditcard.csv` vào thư mục `data/`."
-        )
+    start_btn = st.button("Khoi chay Stream Monitor (Delayed Labels + Active Learning + ADWIN)", type="primary")
+    if not start_btn:
+        st.info("Nhan nut ben tren de mo phong luong giao dich ULB thoi gian thuc (Warm-up -> DelayedLabelQueue -> ADWIN).")
         return
 
-    c1, c2, c3, c4 = st.columns(4)
-    strategy = c1.selectbox(
-        "Chiến lược Active Learning:",
-        ["B4_Hybrid", "B2_TopRisk", "B3_Margin", "B1_Random", "B0_NoAL"],
-        index=0,
-    )
-    n_stream = c2.slider("Số giao dịch test chạy live:", 1000, 15000, 5000, step=1000)
-    chunk_size = c3.selectbox("Kích thước Chunk:", [1000, 2500, 5000], index=0)
-    beta = c4.select_slider("Ngân sách rà soát (beta):", options=[0.0025, 0.005, 0.01], value=0.005)
+    warm_sample = warmup_matured.tail(15000).reset_index(drop=True)
+    stream_sample = test_df.iloc[:n_stream].reset_index(drop=True)
+    budget_per_win = max(1, int(round(beta * window_size)))
 
-    run_btn = st.button("Chạy mô phỏng Live", type="primary")
-    if not run_btn:
-        st.info("Bấm **Chạy mô phỏng Live** để phát trực tiếp luồng giao dịch qua `ARF + Semi-Supervised HST + VerificationController`.")
-        return
+    oml = OnlineFraudModel(n_models=10, seed=42)
+    hst = SemiSupervisedHST(seed=42)
+    use_hst = strategy == "B4_Hybrid"
 
-    with st.spinner("Đang nạp dữ liệu và warm-up nhanh trên 10.000 mẫu lịch sử đã đáo hạn..."):
-        warmup_matured, warmup_pending, test_df, feature_cols = load_split_for_replay()
-        warm_sub = warmup_matured.iloc[-10000:].reset_index(drop=True)
-        test_sub = test_df.iloc[:n_stream].reset_index(drop=True)
+    warm_tail_p: List[float] = []
+    warm_tail_disc: List[float] = []
+    tail_start = max(0, len(warm_sample) - 2000)
+    prog = st.progress(0, text="Dang khoi tao Warm-up ARF + Semi-Supervised HST...")
 
-        X_warm = warm_sub[feature_cols].to_numpy(dtype=np.float32)
-        y_warm = warm_sub["Class"].to_numpy(dtype=np.int32)
-        warm_dicts = [dict(zip(feature_cols, row)) for row in X_warm.tolist()]
+    for i, row in warm_sample.iterrows():
+        x_i = {c: float(row[c]) for c in feature_cols}
+        y_i = int(row["Class"])
+        if i >= tail_start:
+            p_i = oml.predict_proba_one(x_i)
+            s_i = hst.score_one(x_i)
+            warm_tail_p.append(p_i)
+            warm_tail_disc.append(s_i - p_i)
+        oml.learn_one(x_i, y_i)
+        hst.learn_one(x_i, y_i)
 
-        test_times = test_sub["Time"].to_numpy(dtype=np.float64)
-        test_X = test_sub[feature_cols].to_numpy(dtype=np.float32)
-        test_dicts = [dict(zip(feature_cols, row)) for row in test_X.tolist()]
-        test_y = test_sub["Class"].to_numpy(dtype=np.int32)
-
-        oml = OnlineFraudModel(n_models=10, seed=42)
-        use_hst = strategy == "B4_Hybrid"
-        hst = SemiSupervisedHST(seed=42) if use_hst else None
-
-        tail_start = max(0, len(y_warm) - chunk_size)
-        tail_p, tail_disc = [], []
-        for i in range(len(y_warm)):
-            if i >= tail_start:
-                p_i = oml.predict_proba_one(warm_dicts[i])
-                s_i = hst.score_one(warm_dicts[i]) if (use_hst and hst is not None) else 0.0
-                tail_p.append(p_i)
-                tail_disc.append(s_i - p_i)
-            oml.learn_one(warm_dicts[i], int(y_warm[i]))
-            if use_hst and hst is not None:
-                hst.learn_one(warm_dicts[i], int(y_warm[i]))
-
-        budget_per_chunk = max(1, int(round(beta * chunk_size)))
-        p_arr = np.asarray(tail_p, dtype=np.float64)
-        d_arr = np.asarray(tail_disc, dtype=np.float64)
-        init_thresh = min(0.95, max(1e-4, float(np.quantile(p_arr, 1.0 - beta))))
-        init_top = float(np.quantile(p_arr, max(0.0, 1.0 - (budget_per_chunk * 0.7) / max(1, len(p_arr)))))
-        init_disc = float(np.quantile(d_arr, max(0.0, 1.0 - (budget_per_chunk * 0.3) / max(1, len(d_arr)))))
-
-    queue = DelayedLabelQueue(seed=42)
-    # Pre-load last 5000 in-flight rows for realism
-    pend_sub = warmup_pending.iloc[-5000:].reset_index(drop=True)
-    pend_times = pend_sub["Time"].to_numpy(dtype=np.float64)
-    pend_dicts = [dict(zip(feature_cols, row)) for row in pend_sub[feature_cols].to_numpy(dtype=np.float32).tolist()]
-    pend_y = pend_sub["Class"].to_numpy(dtype=np.int32)
-    for idx in range(len(pend_y)):
-        queue.push(tx_id=-(idx + 1), t_arrive=float(pend_times[idx]), x=pend_dicts[idx], y_true=int(pend_y[idx]))
+    p_arr = np.asarray(warm_tail_p, dtype=np.float64)
+    d_arr = np.asarray(warm_tail_disc, dtype=np.float64)
+    init_thresh = min(0.95, max(1e-4, float(np.quantile(p_arr, 1.0 - beta))))
+    top_rate = max(1e-4, (budget_per_win * 0.70) / max(1, len(p_arr)))
+    disc_rate = max(1e-4, (budget_per_win * 0.30) / max(1, len(d_arr)))
 
     thresh_mgr = CausalQuantileThreshold(alert_rate=beta, initial_threshold=init_thresh)
     ctrl = VerificationController(
         strategy=strategy,
-        window_size=chunk_size,
-        budget_per_window=budget_per_chunk,
-        initial_top_threshold=init_top,
-        initial_disc_threshold=init_disc,
+        window_size=window_size,
+        budget_per_window=budget_per_win,
+        hybrid_top_ratio=0.70,
+        initial_top_threshold=float(np.quantile(p_arr, max(0.0, 1.0 - top_rate))),
+        initial_disc_threshold=float(np.quantile(d_arr, max(0.0, 1.0 - disc_rate))),
+        seed=42,
+    )
+    drift_mgr = ADWINDriftManager(
+        delta=adwin_delta,
+        cooldown_duration=300,
+        base_disc_ratio=0.30,
+        boosted_disc_ratio=0.50,
+    )
+    queue = DelayedLabelQueue(
+        confirm_window_sec=confirm_window_sec,
+        min_fraud_delay_sec=1800.0,
+        fast_track_delay_sec=fast_track_delay_sec,
+        unreported_fraud_rate=0.05,
         seed=42,
     )
 
-    progress_bar = st.progress(0)
-    kpi_box = st.empty()
-    chart_box = st.empty()
-    log_box = st.empty()
+    for idx, row in warmup_pending.iterrows():
+        queue.push(
+            tx_id=-(idx + 1),
+            t_arrive=float(row["Time"]),
+            x={c: float(row[c]) for c in feature_cols},
+            y_true=int(row["Class"]),
+            is_fast_track=False,
+        )
 
-    y_scores = np.zeros(n_stream, dtype=np.float64)
-    y_preds = np.zeros(n_stream, dtype=np.int32)
-    latencies = np.zeros(n_stream, dtype=np.float64)
-    ft_logs: List[Dict[str, object]] = []
-    hist_x: List[int] = []
-    hist_yield: List[float] = []
-    hist_queries: List[int] = []
+    y_true_all: List[int] = []
+    y_score_all: List[float] = []
+    y_pred_all: List[int] = []
+    lat_all: List[float] = []
+    stream_rows: List[Dict[str, object]] = []
+    queue_depths: List[int] = []
 
-    update_step = max(100, n_stream // 25)
-    chunk_start = 0
+    allow_cnt, block_cnt, ft_cnt = 0, 0, 0
 
-    for i in range(n_stream):
-        t_now = float(test_times[i])
-        x_i = test_dicts[i]
-        y_true_i = int(test_y[i])
+    for i, row in stream_sample.iterrows():
+        t_now = float(row["Time"])
+        x_i = {c: float(row[c]) for c in feature_cols}
+        y_true_i = int(row["Class"])
 
         for ev in queue.pop_ready(t_now):
             oml.learn_one(ev.x, ev.y_observed)
-            if use_hst and hst is not None:
+            if use_hst:
                 hst.learn_one(ev.x, ev.y_observed)
+            if ev.tx_id >= 0:
+                fired = drift_mgr.update(
+                    y_pred=ev.y_pred_at_arrive,
+                    y_true=ev.y_observed,
+                    current_time=t_now,
+                )
+                if fired and enable_adwin_action:
+                    thresh_mgr.recalibrate_on_drift()
+                if enable_adwin_action and strategy == "B4_Hybrid":
+                    ctrl.set_discordance_ratio(drift_mgr.get_current_disc_ratio())
 
-        t0 = time.perf_counter()
+        ts = time.perf_counter()
         p_hat = oml.predict_proba_one(x_i)
-        s_hst = hst.score_one(x_i) if (use_hst and hst is not None) else 0.0
+        s_hst = hst.score_one(x_i) if use_hst else 0.0
         theta = thresh_mgr.get_threshold()
         y_pred_i = 1 if p_hat >= theta else 0
         dec = ctrl.decide(p_hat=p_hat, hst_score=s_hst, decision_threshold=theta)
-        latencies[i] = (time.perf_counter() - t0) * 1000.0
-
-        y_scores[i] = p_hat
-        y_preds[i] = y_pred_i
-        thresh_mgr.record_score(p_hat)
+        lat_ms = (time.perf_counter() - ts) * 1000.0
 
         if dec.should_query:
+            action = "FAST_TRACK"
+            ft_cnt += 1
             if y_true_i == 1:
                 ctrl.record_outcome(1)
-            ft_logs.append(
-                {
-                    "tx_id": i,
-                    "Time_sec": int(t_now),
-                    "p_hat": round(p_hat, 4),
-                    "S_HST": round(s_hst, 4),
-                    "Delta_disc": round(s_hst - p_hat, 4),
-                    "Trigger_Reason": dec.reason,
-                    "Actual_Label": "FRAUD (Hit)" if y_true_i == 1 else "Legit",
-                }
-            )
+        elif y_pred_i == 1:
+            action = "BLOCK"
+            block_cnt += 1
+        else:
+            action = "ALLOW"
+            allow_cnt += 1
+
+        y_true_all.append(y_true_i)
+        y_score_all.append(p_hat)
+        y_pred_all.append(y_pred_i)
+        lat_all.append(lat_ms)
+        thresh_mgr.record_score(p_hat)
+        queue_depths.append(queue.pending_count())
+
+        stream_rows.append(
+            {
+                "tx_id": i,
+                "t_arrive": t_now,
+                "p_hat": p_hat,
+                "S_HST": s_hst,
+                "Delta_disc": max(0.0, s_hst - p_hat),
+                "theta": theta,
+                "action": action,
+                "y_true": y_true_i,
+            }
+        )
 
         queue.push(
             tx_id=i,
@@ -364,89 +258,211 @@ def render_live_replay_tab() -> None:
             y_true=y_true_i,
             is_fast_track=dec.should_query,
             p_hat_at_arrive=p_hat,
+            y_pred_at_arrive=y_pred_i,
         )
 
-        if ((i + 1 - chunk_start) == chunk_size) or (i == n_stream - 1):
+        if (i + 1) % window_size == 0:
             thresh_mgr.end_chunk()
             ctrl.end_window()
-            chunk_start = i + 1
 
-        if (i + 1) % update_step == 0 or i == n_stream - 1:
-            progress_bar.progress((i + 1) / n_stream)
-            hist_x.append(i + 1)
-            hist_yield.append(ctrl.verification_yield * 100.0)
-            hist_queries.append(ctrl.total_queries)
+        if (i + 1) % max(1, n_stream // 20) == 0 or i == n_stream - 1:
+            prog.progress(int((i + 1) / n_stream * 100), text=f"Dang xu ly {i + 1:,}/{n_stream:,} giao dich...")
 
-            with kpi_box.container():
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Đã xử lý", f"{i + 1:,} / {n_stream:,}")
-                k2.metric("Lượt Fast-Track đã dùng", f"{ctrl.total_queries}")
-                k3.metric("Gian lận bắt được sớm", f"{ctrl.total_true_frauds_found}")
-                k4.metric("Verification Yield", f"{ctrl.verification_yield * 100:.2f}%")
+    prog.empty()
 
-            fig, ax1 = plt.subplots(figsize=(9.5, 3.0))
-            ax1.plot(hist_x, hist_yield, color="#10b981", marker="o", markersize=3.5, label="Verification Yield (%)")
-            ax1.set_xlabel("Số giao dịch đã xử lý")
-            ax1.set_ylabel("Verification Yield (%)", color="#10b981")
-            ax1.grid(True, linestyle="--", alpha=0.35)
-            ax2 = ax1.twinx()
-            ax2.plot(hist_x, hist_queries, color="#2563eb", linestyle="--", label="Tổng lượt Fast-Track")
-            ax2.set_ylabel("Tổng lượt Fast-Track", color="#2563eb")
-            fig.tight_layout()
-            chart_box.pyplot(fig)
-            plt.close(fig)
-
-            if ft_logs:
-                log_box.dataframe(pd.DataFrame(ft_logs[-15:][::-1]), hide_index=True)
-
-    final_m = compute_metrics(
-        y_true=test_y,
-        y_scores=y_scores,
-        y_pred=y_preds,
-        k=max(1, int(round(beta * n_stream))),
-        latencies_ms=latencies,
+    k_eval = max(1, int(round(beta * n_stream)))
+    m = compute_metrics(
+        y_true=y_true_all,
+        y_scores=y_score_all,
+        y_pred=y_pred_all,
+        k=k_eval,
+        latencies_ms=lat_all,
         fast_track_queries=ctrl.total_queries,
         fast_track_frauds=ctrl.total_true_frauds_found,
     )
-    st.success(
-        f"Hoàn tất replay {n_stream:,} giao dịch ({strategy}) | "
-        f"AP = {final_m['AP']:.4f} | Pr@k = {final_m['Pr@k']:.4f} | "
-        f"Recall = {final_m['Recall']:.4f} | FP = {int(final_m['FP'])} | "
-        f"Yield = {final_m['Verification_Yield']*100:.2f}% | "
-        f"Mean Latency = {final_m['mean_latency_ms']:.3f} ms/tx"
+
+    # 6 KPI Metric Cards (Membau/OnlineML-Fraud-Detector layout)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Tong Giao Dich", f"{n_stream:,}")
+    k2.metric("PR-AUC (AP)", f"{m['AP']:.4f}")
+    k3.metric(f"Pr@{k_eval}", f"{m['Pr@k']:.4f}")
+    k4.metric("Precision / Recall", f"{m['Precision']:.3f} / {m['Recall']:.3f}")
+    k5.metric("Verification Yield", f"{m['Verification_Yield']*100:.2f}%", f"{int(m['FastTrack_Frauds'])}/{int(m['FastTrack_Queries'])}")
+    k6.metric("ADWIN Drifts", f"{len(drift_mgr.drift_events)}", f"Cooldown: {'ON' if drift_mgr.is_in_cooldown() else 'OFF'}")
+
+    st.divider()
+    sdf = pd.DataFrame(stream_rows)
+    col_l, col_r = st.columns([2, 1])
+
+    with col_l:
+        st.subheader("Xac Suat Gian Lan (ARF) & Bat Thuong HST Theo Thoi Gian")
+        tail_df = sdf.tail(400)
+        fig_line = go.Figure()
+        fig_line.add_trace(go.Scatter(x=tail_df["tx_id"], y=tail_df["p_hat"], name="p_hat (ARF)", line=dict(color="#58A6FF", width=1.8)))
+        if use_hst:
+            fig_line.add_trace(go.Scatter(x=tail_df["tx_id"], y=tail_df["S_HST"], name="S_HST", line=dict(color="#3FB950", width=1.4)))
+        fig_line.add_trace(go.Scatter(x=tail_df["tx_id"], y=tail_df["theta"], name="Causal Threshold", line=dict(color="#FACC15", dash="dash")))
+        fig_line.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig_line, use_container_width=True)
+
+    with col_r:
+        st.subheader("Ty Le ALLOW / BLOCK / FAST_TRACK")
+        fig_pie = go.Figure(
+            data=[
+                go.Pie(
+                    labels=["ALLOW", "BLOCK", "FAST_TRACK"],
+                    values=[allow_cnt, block_cnt, ft_cnt],
+                    hole=0.45,
+                    marker_colors=["#238636", "#DA3633", "#D29922"],
+                )
+            ]
+        )
+        fig_pie.update_layout(template="plotly_dark", height=320, margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    c_cm, c_q = st.columns(2)
+    with c_cm:
+        tp = int(m["TP"])
+        fp = int(m["FP"])
+        fn = int(sum(y_true_all)) - tp
+        tn = len(y_true_all) - tp - fp - fn
+        cm = [[tn, fp], [fn, tp]]
+        fig_cm = go.Figure(
+            data=go.Heatmap(
+                z=cm,
+                x=["Pred 0 (Allow)", "Pred 1 (Block)"],
+                y=["True 0 (Legit)", "True 1 (Fraud)"],
+                colorscale="Blues",
+                showscale=False,
+                text=cm,
+                texttemplate="%{text}",
+            )
+        )
+        fig_cm.update_layout(template="plotly_dark", title="Cumulative Confusion Matrix", height=270, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_cm, use_container_width=True)
+
+    with c_q:
+        fig_q = go.Figure()
+        fig_q.add_trace(go.Scatter(x=sdf["tx_id"], y=queue_depths, name="Pending Labels", fill="tozeroy", line=dict(color="#D29922")))
+        fig_q.update_layout(template="plotly_dark", title="DelayedLabelQueue Backlog (In-Flight Labels)", height=270, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_q, use_container_width=True)
+
+    if drift_mgr.drift_events:
+        st.subheader("ADWIN Drift Events Log (0-1 Error Stream)")
+        st.dataframe(pd.DataFrame(drift_mgr.drift_events), use_container_width=True, hide_index=True)
+
+    st.subheader("Nhat Ky Giao Dich Gan Nhat (Audit Log)")
+    audit_df = sdf.sort_values("tx_id", ascending=False).head(100)
+    st.dataframe(
+        audit_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "p_hat": st.column_config.ProgressColumn("P(fraud) ARF", min_value=0.0, max_value=1.0, format="%.4f"),
+            "S_HST": st.column_config.ProgressColumn("S_HST Anomaly", min_value=0.0, max_value=1.0, format="%.4f"),
+            "Delta_disc": st.column_config.ProgressColumn("Discordance", min_value=0.0, max_value=1.0, format="%.4f"),
+            "action": st.column_config.TextColumn("Quyet Dinh"),
+        },
     )
 
 
-def main() -> None:
-    st.title("OnlineML-ActiveFraud — Selective Verification Dashboard")
-    st.caption(
-        "Stream-based Active Learning (Semi-Supervised HST–Tree Discordance) dưới môi trường Nhãn trễ vs Batch XGBoost"
+def render_benchmark_tab(summary: pd.DataFrame, chunks: pd.DataFrame) -> None:
+    b0 = summary.loc[summary["model"] == "B0_NoAL"].iloc[0]
+    b4 = summary.loc[summary["model"] == "B4_Hybrid"].iloc[0]
+    m_static = summary.loc[summary["model"] == "M_Static_Batch"].iloc[0]
+
+    ap_gain = ((b4["AP"] - b0["AP"]) / max(1e-9, b0["AP"])) * 100.0
+    gap_closed = ((b4["AP"] - b0["AP"]) / max(1e-9, m_static["AP"] - b0["AP"])) * 100.0
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("B4_Hybrid AP", f"{b4['AP']:.4f}", f"+{ap_gain:.1f}% vs B0")
+    k2.metric("B4_Hybrid Pr@k", f"{b4['Pr@k']:.4f}", f"vs {b0['Pr@k']:.4f} (B0)")
+    k3.metric("B4 Recall / Prec", f"{b4['Recall']:.3f} / {b4['Precision']:.3f}")
+    k4.metric("Verification Yield", f"{b4['Verification_Yield']*100:.2f}%", f"{int(b4['FastTrack_Frauds'])}/{int(b4['FastTrack_Queries'])}")
+    k5.metric("Gap Closed vs XGB", f"{gap_closed:.1f}%")
+    k6.metric("Latency (B4)", f"{b4['mean_latency_ms']:.3f} ms", f"p99: {b4['p99_latency_ms']:.3f} ms")
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_bar = px.bar(
+            summary,
+            x="model",
+            y=["AP", "Pr@k"],
+            barmode="group",
+            template="plotly_dark",
+            title="Online Active Learning vs Batch XGBoost (AP & Pr@k)",
+            height=360,
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    with col2:
+        al_df = summary[summary["FastTrack_Queries"] > 0]
+        fig_yield = px.bar(
+            al_df,
+            x="model",
+            y=al_df["Verification_Yield"] * 100.0,
+            text=al_df.apply(lambda r: f"{r['Verification_Yield']*100:.2f}% ({int(r['FastTrack_Frauds'])}/{int(r['FastTrack_Queries'])})", axis=1),
+            template="plotly_dark",
+            title="Active Learning Verification Yield (%)",
+            labels={"y": "Yield (%)"},
+            height=360,
+        )
+        st.plotly_chart(fig_yield, use_container_width=True)
+
+    selected = st.multiselect(
+        "Chon mo hinh xem quy dao Chunk AP:",
+        options=summary["model"].tolist(),
+        default=["B0_NoAL", "B2_TopRisk", "B4_Hybrid", "M_Static_Batch", "M_Periodic_Batch_AL"],
+    )
+    if selected:
+        sub = chunks[chunks["model"].isin(selected)]
+        fig_traj = px.line(
+            sub,
+            x="chunk_id",
+            y="AP",
+            color="model",
+            markers=True,
+            template="plotly_dark",
+            title="Chunk-by-Chunk AP Trajectory (29 Chunks, 142.404 Test Transactions)",
+            height=360,
+        )
+        st.plotly_chart(fig_traj, use_container_width=True)
+
+    st.subheader("Bang Tong Hop Benchmark (142.404 Giao Dich Kiem Thu)")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+
+with st.sidebar:
+    st.header("Cau Hinh Cong Bien & Active Learning")
+    st.caption("OnlineML-ActiveFraud | Delayed Labels + ADWIN")
+    strategy = st.selectbox("Chien luoc Active Learning", ["B4_Hybrid", "B2_TopRisk", "B3_Margin", "B1_Random", "B0_NoAL"], index=0)
+    beta = st.slider("Ngan sach ra soat (beta)", 0.0025, 0.0200, 0.0050, 0.0025, format="%.4f")
+    window_size = st.slider("Cua so ngan sach (W)", 1000, 5000, 5000, 1000)
+    confirm_window_sec = st.slider("Do tre nhan chuan D (giay)", 3600, 21600, 21600, 3600)
+    fast_track_delay_sec = st.slider("Do tre Fast-Track d_fast (giay)", 60, 900, 300, 60)
+    adwin_delta = st.select_slider("ADWIN delta (0-1 error stream)", options=[0.0005, 0.001, 0.002, 0.005, 0.01], value=0.002)
+    enable_adwin_action = st.checkbox("Kich hoat phan ung ADWIN (Boost Discordance 30%->50%)", value=True)
+    n_stream = st.slider("So giao dich mo phong Live", 2000, 30000, 8000, 2000)
+
+st.title("Payment Edge Fraud Monitor — Active Learning & ADWIN")
+tab1, tab2 = st.tabs(["Live Stream Monitor (AL + Delayed Labels + ADWIN)", "Benchmark Results (142.404 Tx)"])
+
+with tab1:
+    render_live_monitor_tab(
+        strategy=strategy,
+        beta=beta,
+        window_size=window_size,
+        confirm_window_sec=float(confirm_window_sec),
+        fast_track_delay_sec=float(fast_track_delay_sec),
+        adwin_delta=float(adwin_delta),
+        enable_adwin_action=enable_adwin_action,
+        n_stream=n_stream,
     )
 
-    summary, chunks = load_results()
-    tab1, tab2, tab3 = st.tabs(
-        [
-            "1. So sánh 8 Mô hình",
-            "2. Quỹ đạo Chunk & Kiến trúc",
-            "3. Mô phỏng Luồng Live",
-        ]
-    )
-
-    with tab1:
-        if summary is None:
-            st.error("Chưa có `results/ablation_al_summary.csv`. Hãy chạy `python -m experiments.run_benchmark` trước.")
-        else:
-            render_comparison_tab(summary)
-
-    with tab2:
-        if chunks is None:
-            st.error("Chưa có `results/chunk_metrics.csv`.")
-        else:
-            render_chunk_and_arch_tab(chunks)
-
-    with tab3:
-        render_live_replay_tab()
-
-
-if __name__ == "__main__":
-    main()
+with tab2:
+    summary_df, chunk_df = load_benchmark_results()
+    if summary_df is None or chunk_df is None:
+        st.warning("Chua co file ket qua trong `results/`. Hay chay `python experiments/run_benchmark.py`.")
+    else:
+        render_benchmark_tab(summary_df, chunk_df)

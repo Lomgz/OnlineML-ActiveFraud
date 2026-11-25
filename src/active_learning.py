@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
@@ -42,6 +42,20 @@ class CausalQuantileThreshold:
             q = max(0.0, min(1.0, 1.0 - self.alert_rate))
             raw = float(np.quantile(np.asarray(self._completed_scores, dtype=np.float64), q))
             self._threshold = min(self.max_threshold, max(self.min_threshold, raw))
+        return self._threshold
+
+    def recalibrate_on_drift(self, recent_tail: int = 2000) -> float:
+        """
+        Recalibrate threshold strictly from the most recent completed historical scores
+        upon an ADWIN drift event (never touching current-chunk scores).
+        """
+        if self._completed_scores:
+            tail = list(self._completed_scores)[-max(100, int(recent_tail)) :]
+            q = max(0.0, min(1.0, 1.0 - self.alert_rate))
+            raw = float(np.quantile(np.asarray(tail, dtype=np.float64), q))
+            self._threshold = min(self.max_threshold, max(self.min_threshold, raw))
+        else:
+            self._threshold = max(self.min_threshold, self._threshold * 0.90)
         return self._threshold
 
 
@@ -193,6 +207,13 @@ class VerificationController:
         self._window_p_hats.clear()
         self._window_discs.clear()
         return self.top_threshold, self.disc_threshold
+
+    def set_discordance_ratio(self, disc_ratio: float) -> None:
+        """Dynamically adjust B4_Hybrid Top-Risk/Discordance split within hard cap B."""
+        clamped_disc = min(0.90, max(0.0, float(disc_ratio)))
+        self.hybrid_top_ratio = 1.0 - clamped_disc
+        self.budget_top = int(round(self.budget_per_window * self.hybrid_top_ratio))
+        self.budget_disc = max(0, self.budget_per_window - self.budget_top)
 
     @property
     def verification_yield(self) -> float:
