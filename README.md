@@ -20,3 +20,9 @@ OnlineML-ActiveFraud/
 ├── SPEC_AL_SV.md            # Đặc tả kỹ thuật triển khai
 ├── REPORT.md                # Báo cáo phân tích kết quả thực nghiệm đầy đủ
 └── requirements.txt
+## Chạy Dashboard UI tương tác
+
+```powershell
+streamlit run dashboard.py
+```
+
